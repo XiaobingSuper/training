@@ -69,25 +69,35 @@ def parse_args():
 
 # TODO: val_epoch is not currently supported on cpu
 def val_epoch(model, x, y, dup_mask, real_indices, K, samples_per_user, num_user, output=None,
-              epoch=None, loss=None):
+              epoch=None, loss=None, use_cuda = True):
 
     start = datetime.now()
     log_2 = math.log(2)
 
     model.eval()
-    hits = torch.tensor(0., device='cuda')
-    ndcg = torch.tensor(0., device='cuda')
+    if use_cuda:
+        device = 'cuda'
+    else:
+        device = 'cpu'
+    hits = torch.tensor(0., device=device)
+    ndcg = torch.tensor(0., device=device)
 
     with torch.no_grad():
         for i, (u,n) in enumerate(zip(x,y)):
-            res = model(u.cuda().view(-1), n.cuda().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
+            if use_cuda:
+                res = model(u.cuda().view(-1), n.cuda().view(-1), sigmoid=True).detach().view(-1,samples_per_user)
+            else:
+                res = model(u.view(-1), n.view(-1), sigmoid=True).detach().view(-1,samples_per_user)
             # set duplicate results for the same item to -1 before topk
             res[dup_mask[i]] = -1
             out = torch.topk(res,K)[1]
             # topk in pytorch is stable(if not sort)
             # key(item):value(predicetion) pairs are ordered as original key(item) order
             # so we need the first position of real item(stored in real_indices) to check if it is in topk
-            ifzero = (out == real_indices[i].cuda().view(-1,1))
+            if use_cuda:
+                ifzero = (out == real_indices[i].cuda().view(-1,1))
+            else:
+                ifzero = (out == real_indices[i].view(-1,1))
             hits += ifzero.sum()
             ndcg += (log_2 / (torch.nonzero(ifzero)[:,1].view(-1).to(torch.float)+2).log_()).sum()
 
@@ -148,7 +158,8 @@ def main():
     mlperf_log.ncf_print(key=mlperf_log.INPUT_STEP_EVAL_NEG_GEN)
 
     # sync worker before timing.
-    torch.cuda.synchronize()
+    if use_cuda:
+        torch.cuda.synchronize()
 
     #===========================================================================
     #== The clock starts on loading the preprocessed data. =====================
@@ -168,7 +179,6 @@ def main():
         test_ratings[chunk] = torch.from_numpy(np.load(args.data + '/testx' 
                 + str(args.user_scaling) + 'x' + str(args.item_scaling) 
                 + '_' + str(chunk) + '.npz', encoding='bytes')['arr_0'])
-        
     print("New ratings loaded.", datetime.now())
 
 
@@ -254,7 +264,8 @@ def main():
     real_indices = torch.cat(real_indices)
 
     # make pytorch memory behavior more consistent later
-    torch.cuda.empty_cache()
+    if use_cuda:
+        torch.cuda.empty_cache()
 
     mlperf_log.ncf_print(key=mlperf_log.INPUT_BATCH_SIZE, value=args.batch_size)
     mlperf_log.ncf_print(key=mlperf_log.INPUT_ORDER)  # we shuffled later with randperm
@@ -307,8 +318,9 @@ def main():
     dup_mask = dup_mask.split(users_per_valid_batch)
     real_indices = real_indices.split(users_per_valid_batch)
 
-    hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                         num_user=all_test_users)
+    #hr=0
+    #ndcg=0
+    hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user, num_user=all_test_users, use_cuda=use_cuda)
     print('Initial HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f}'
           .format(K=args.topk, hit_rate=hr, ndcg=ndcg))
     success = False
@@ -352,36 +364,108 @@ def main():
         if len(epoch_users_list) < num_batches:
             print("epoch_size % batch_size < number of worker!")
             exit(1)
-        
+
         after_shuffle = time.time()
-        
+
         neg_gen_time = (after_neg_gen - begin)
         shuffle_time = (after_shuffle - after_neg_gen)
 
+        #time_fwd, time_bwd, time_upt = 0, 0, 0
+        #begin_time = time.time()
+
         for i in qbar:
             # selecting input from prepared data
-            user = epoch_users_list[i].cuda()
-            item = epoch_items_list[i].cuda()
-            label = epoch_label_list[i].view(-1,1).cuda()
+            if use_cuda:
+                user = epoch_users_list[i].cuda()
+                item = epoch_items_list[i].cuda()
+                label = epoch_label_list[i].view(-1,1).cuda()
+            else:
+                user = epoch_users_list[i]
+                item = epoch_items_list[i]
+                label = epoch_label_list[i].view(-1,1)
 
             for p in model.parameters():
                 p.grad = None
-
+            #t1 = time.time()
             outputs = model(user, item)
+            #t2 = time.time()
             loss = traced_criterion(outputs, label).float()
             loss = torch.mean(loss.view(-1), 0)
-
+            #t3 = time.time()
             loss.backward()
+
+            #t4 = time.time()
             optimizer.step()
-       
+            #t5 = time.time()
+
+            # only print once
+        '''
+            print("grad size and density")
+            for p in model.parameters():
+                print(p.grad.size())
+                print("the density is %10.2f" % (p.grad.nonzero().size(0)/p.grad.numel()))
+
+            time_fwd = time_fwd + (t2 - t1)
+            time_bwd = time_bwd + (t4 - t3)
+            time_upt = time_upt + (t5 - t4)
+
+            if i == 50:
+                break
+        '''
+
+        '''
+        # for profiler data
+        time_fwd, time_bwd, time_upt = 0, 0, 0
+        begin_time = time.time()
+        with torch.autograd.profiler.profile(use_cuda=use_cuda) as prof:
+            for i in qbar:
+                # selecting input from prepared data
+                if use_cuda:
+                    user = epoch_users_list[i].cuda()
+                    item = epoch_items_list[i].cuda()
+                    label = epoch_label_list[i].view(-1,1).cuda()
+                else:
+                    user = epoch_users_list[i]
+                    item = epoch_items_list[i]
+                    label = epoch_label_list[i].view(-1,1)
+
+                for p in model.parameters():
+                    p.grad = None
+                t1 = time.time()
+                outputs = model(user, item)
+                t2 = time.time()
+                loss = traced_criterion(outputs, label).float()
+                loss = torch.mean(loss.view(-1), 0)
+                t3 = time.time()
+                loss.backward()
+                t4 = time.time()
+                optimizer.step()
+                t5 = time.time()
+                time_fwd = time_fwd + (t2 - t1)
+                time_bwd = time_bwd + (t4 - t3)
+                time_upt = time_upt + (t5 - t4)
+                if i == 500:
+                    break
+
+        prof.export_chrome_trace("profiler/result_cpu_big.json")
+        '''
+
+        '''
+        time_total = time.time() - begin_time
+        print("The forword time is %10.2f (s)" %(time_fwd))
+        print("The backword time is %10.2f (s)" %(time_bwd))
+        print("The update time is %10.2f (s)" %(time_upt))
+        print("The total time is %10.2f (s)" %(time_total))
+        '''
         del epoch_users, epoch_items, epoch_label, epoch_users_list, epoch_items_list, epoch_label_list, user, item, label
         train_time = time.time() - begin
         begin = time.time()
 
         mlperf_log.ncf_print(key=mlperf_log.EVAL_START, value=epoch)
-
-        hr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user,
-                             num_user=all_test_users, output=valid_results_file, epoch=epoch, loss=loss.data.item())
+        
+        #ihr=0
+        #ndcg=0
+        ihr, ndcg = val_epoch(model, test_users, test_items, dup_mask, real_indices, args.topk, samples_per_user=samples_per_user, num_user=all_test_users, output=valid_results_file, epoch=epoch, loss=loss.data.item(), use_cuda = use_cuda)
 
         val_time = time.time() - begin
         print('Epoch {epoch}: HR@{K} = {hit_rate:.4f}, NDCG@{K} = {ndcg:.4f},'

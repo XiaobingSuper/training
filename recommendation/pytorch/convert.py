@@ -18,8 +18,7 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    args = parse_args()
-    
+    args = parse_args() 
     train_ratings = torch.LongTensor()
     test_chunk_size = [0] * args.user_scaling
     for chunk in range(args.user_scaling):
@@ -35,9 +34,7 @@ def main():
     nb_maxs = torch.max(train_ratings, 0)[0]
     nb_users = nb_maxs[0].item()+1
     nb_items = nb_maxs[1].item()+1
-
     sampler = NegativeSampler(train_ratings, nb_users, nb_items)
-    
     print(datetime.now(), 'Generating negative test samples...')
     
     test_negatives = [torch.LongTensor()] * args.user_scaling
